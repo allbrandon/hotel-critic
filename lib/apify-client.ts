@@ -1,39 +1,41 @@
 import { ApifyClient } from "apify-client";
 import type { Review, Platform } from "@/types";
-import { isValidHotelUrl } from "./url-validator";
+import { isValidHotelUrl, extractPlaceId } from "./url-validator";
 
 /**
  * Platform rating scales for normalization
  */
 const PLATFORM_SCALES: Partial<Record<Platform, number>> = {
-  google: 5,      // 0-5 scale
-  yelp: 5,        // 0-5 scale
+  google: 5, // 0-5 scale
+  yelp: 5, // 0-5 scale
   tripadvisor: 5, // 0-5 scale (displayed as bubbles)
-  booking: 10,    // 0-10 scale
-  expedia: 10,    // 0-10 scale
-  hotelscom: 10,  // 0-10 scale
-  airbnb: 5,      // 0-5 scale
+  booking: 10, // 0-10 scale
+  expedia: 10, // 0-10 scale
+  hotelscom: 10, // 0-10 scale
+  airbnb: 5, // 0-5 scale
 };
 
 /**
- * Apify API response structure
+ * Apify Hotel Review Aggregator response structure
+ * Each item in the dataset is a single review
+ * See: https://apify.com/tri_angle/hotel-review-aggregator
  */
-interface ApifyReviewData {
-  id?: string;
-  text?: string;
-  rating?: number;
-  date?: string;
-  reviewer?: string;
-  platform?: string;
-  language?: string;
-}
-
-interface ApifyHotelData {
-  name?: string;
-  address?: string;
-  reviews?: ApifyReviewData[];
-  googleMapsUrl?: string;
-  platforms?: Record<string, { score: number; reviewCount: number; url: string }>;
+interface ApifyReviewItem {
+  googleMapsPlaceId: string;
+  placeName: string;
+  placeAlternateNames?: string[];
+  placeUrl: string;
+  placeAddress: string;
+  provider: string; // "google-maps" | "tripadvisor" | "yelp" | "airbnb" | "booking" | "expedia" | "hotels"
+  reviewId: string;
+  reviewUrl?: string | null;
+  reviewTitle?: string | null;
+  reviewText: string;
+  reviewDate: string;
+  reviewRating: string | number;
+  authorName: string;
+  reviewImages?: string[];
+  reviewResponses?: string[];
 }
 
 /**
@@ -57,25 +59,26 @@ function isMockMode(): boolean {
 }
 
 /**
- * Normalize a platform name from Apify response to our Platform type
+ * Normalize provider name from Apify response to our Platform type
+ * Apify uses: "google-maps", "tripadvisor", "yelp", "airbnb", "booking", "expedia", "hotels"
  */
-function normalizePlatformName(platform: string): Platform {
-  const normalized = platform.toLowerCase().replace(/[^a-z]/g, "");
+function normalizeProvider(provider: string): Platform {
+  const normalized = provider.toLowerCase().replace(/[^a-z]/g, "");
 
-  const platformMap: Record<string, Platform> = {
-    google: "google",
+  const providerMap: Record<string, Platform> = {
     googlemaps: "google",
+    google: "google",
     tripadvisor: "tripadvisor",
     booking: "booking",
     bookingcom: "booking",
     expedia: "expedia",
-    hotelscom: "hotelscom",
     hotels: "hotelscom",
+    hotelscom: "hotelscom",
     yelp: "yelp",
     airbnb: "airbnb",
   };
 
-  return platformMap[normalized] || "google";
+  return providerMap[normalized] || "google";
 }
 
 /**
@@ -205,30 +208,34 @@ function generateMockHotelData(url: string): FetchReviewsResult {
 }
 
 /**
- * Convert Apify response to our Review format
+ * Convert Apify review item to our Review format
  */
-function convertApifyReview(data: ApifyReviewData): Review {
-  const platformName = data.platform || "google";
-  const platform = normalizePlatformName(platformName);
-  const rating = data.rating || 0;
+function convertApifyReview(item: ApifyReviewItem): Review {
+  const platform = normalizeProvider(item.provider);
+  const rating =
+    typeof item.reviewRating === "string"
+      ? parseFloat(item.reviewRating)
+      : item.reviewRating;
   const normalizedRating = normalizeRating(rating, platform);
 
   return {
-    id: data.id || `${platform}-${Date.now()}-${Math.random()}`,
+    id: item.reviewId || `${platform}-${Date.now()}-${Math.random()}`,
     platform,
     rating,
     normalizedRating,
-    text: data.text || "",
-    date: data.date || new Date().toISOString(),
-    reviewerName: data.reviewer,
-    language: data.language,
+    text: item.reviewText || "",
+    date: item.reviewDate || new Date().toISOString(),
+    reviewerName: item.authorName,
+    language: undefined, // Not provided by API
   };
 }
 
 /**
- * Fetch hotel reviews from Apify API
- * Input: Google Maps URL
+ * Fetch hotel reviews from Apify Hotel Review Aggregator
+ * Input: Google Maps URL or Place ID
  * Output: Aggregated reviews from multiple platforms
+ *
+ * API: https://apify.com/tri_angle/hotel-review-aggregator
  */
 export async function fetchHotelReviews(
   googleMapsUrl: string
@@ -264,30 +271,42 @@ export async function fetchHotelReviews(
   try {
     const client = new ApifyClient({ token: apiToken });
 
-    // Call the hotel-review-aggregator actor with Google Maps URL
-    const run = await client.actor("tri_angle/hotel-review-aggregator").call({
-      startUrls: [{ url: validation.normalizedUrl || googleMapsUrl }],
-      maxReviews: 500, // Limit for cost control
-    });
+    // Extract Place ID if available for more reliable matching
+    const placeId = extractPlaceId(googleMapsUrl);
 
-    // Get results from the dataset
-    const result = await client
-      .dataset(run.defaultDatasetId)
-      .listItems();
+    // Build input for the Actor
+    // See: https://apify.com/tri_angle/hotel-review-aggregator#input
+    const input: {
+      startUrls?: Array<{ url: string }>;
+      startIds?: string[];
+      scrapeReviewPictures?: boolean;
+      scrapeReviewResponses?: boolean;
+    } = {
+      scrapeReviewPictures: false, // Skip images for performance
+      scrapeReviewResponses: false, // Skip owner responses for performance
+    };
 
-    const items = result.items as ApifyHotelData[];
-
-    if (!items || items.length === 0) {
-      return {
-        success: false,
-        error: "No data returned from Apify",
-        errorCode: "NO_REVIEWS",
-      };
+    // Prefer Place ID if available, otherwise use URL
+    if (placeId) {
+      input.startIds = [placeId];
+    } else {
+      input.startUrls = [{ url: validation.normalizedUrl || googleMapsUrl }];
     }
 
-    const hotelData = items[0];
+    console.log("[Apify] Calling hotel-review-aggregator with input:", input);
 
-    if (!hotelData.reviews || hotelData.reviews.length === 0) {
+    // Call the hotel-review-aggregator actor
+    const run = await client
+      .actor("tri_angle/hotel-review-aggregator")
+      .call(input);
+
+    // Get results from the dataset
+    // Each item is a single review (not a hotel with nested reviews)
+    const result = await client.dataset(run.defaultDatasetId).listItems();
+
+    const items = result.items as unknown as ApifyReviewItem[];
+
+    if (!items || items.length === 0) {
       return {
         success: false,
         error: "No reviews found for this hotel",
@@ -295,26 +314,36 @@ export async function fetchHotelReviews(
       };
     }
 
-    // Convert reviews to our format
-    const reviews = hotelData.reviews.map(convertApifyReview);
+    // Extract hotel info from first review (all reviews share same hotel data)
+    const firstItem = items[0];
+    const hotelName = firstItem.placeName;
+    const hotelAddress = firstItem.placeAddress;
 
-    // Build platform URLs from response
+    // Convert all reviews to our format
+    const reviews = items.map(convertApifyReview);
+
+    // Build platform URLs from review data
     const platformUrls: Partial<Record<Platform, string>> = {};
-    if (hotelData.platforms) {
-      for (const [platformName, data] of Object.entries(hotelData.platforms)) {
-        if (data.url) {
-          const platform = normalizePlatformName(platformName);
-          platformUrls[platform] = data.url;
+    for (const item of items) {
+      if (item.placeUrl) {
+        const platform = normalizeProvider(item.provider);
+        // Only set if not already set (first occurrence wins)
+        if (!platformUrls[platform]) {
+          platformUrls[platform] = item.placeUrl;
         }
       }
     }
     // Always include the original Google Maps URL
     platformUrls.google = googleMapsUrl;
 
+    console.log(
+      `[Apify] Fetched ${reviews.length} reviews from ${Object.keys(platformUrls).length} platforms`
+    );
+
     return {
       success: true,
-      hotelName: hotelData.name,
-      hotelAddress: hotelData.address,
+      hotelName,
+      hotelAddress,
       reviews,
       platformUrls,
     };
@@ -331,10 +360,10 @@ export async function fetchHotelReviews(
 
 /**
  * Estimate cost for an Apify API call
- * Based on compute units used
+ * Based on pay-per-event pricing
  */
 export function estimateApifyCost(reviewCount: number): number {
-  // Rough estimate: $0.15-0.25 per 500 reviews
+  // Rough estimate based on Apify pricing
   const baseRate = 0.0004; // $ per review
   return Math.round(reviewCount * baseRate * 100) / 100;
 }
